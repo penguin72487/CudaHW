@@ -20,6 +20,7 @@ namespace {
 
 using namespace std;
 
+// 簡單的 row-major uint8 矩陣容器，供 S 與 T 共同使用。
 struct MatrixU8 {
     int rows = 0;
     int cols = 0;
@@ -35,8 +36,13 @@ struct ArgConfig {
     string smallPath;
     string largePath;
     vector<BlockSize> blocks;
+    bool runThreadSweep = false;
+    int threadSweepMax = 12;
+    int sweepRepeats = 3;
+    string threadSweepCsv;
 };
 
+// 將 CUDA 回傳碼轉成含來源位置的 C++ 例外。
 inline void cudaCheck(cudaError_t err, const char* file, int line) {
     if (err != cudaSuccess) {
         ostringstream oss;
@@ -52,10 +58,12 @@ class DeviceBuffer {
   public:
     DeviceBuffer() = default;
 
+    // 在 GPU 上配置可容納 count 個元素的連續記憶體。
     explicit DeviceBuffer(size_t count) : count_(count) {
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ptr_), count_ * sizeof(T)));
     }
 
+    // 解構時自動釋放 GPU 記憶體（RAII）。
     ~DeviceBuffer() {
         if (ptr_) {
             cudaFree(ptr_);
@@ -65,6 +73,7 @@ class DeviceBuffer {
     DeviceBuffer(const DeviceBuffer&) = delete;
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
 
+    // 支援 move，必要時可安全地放進標準容器。
     DeviceBuffer(DeviceBuffer&& other) noexcept
         : ptr_(exchange(other.ptr_, nullptr)), count_(exchange(other.count_, 0)) {}
 
@@ -81,6 +90,7 @@ class DeviceBuffer {
 
     T* get() const { return ptr_; }
 
+    // 將主機端向量複製到已配置好的 GPU 記憶體。
     void copyFromHost(const vector<T>& host) const {
         if (host.size() != count_) {
             throw runtime_error("Host/device size mismatch in copyFromHost");
@@ -88,6 +98,7 @@ class DeviceBuffer {
         CUDA_CHECK(cudaMemcpy(ptr_, host.data(), count_ * sizeof(T), cudaMemcpyHostToDevice));
     }
 
+    // 將 GPU 記憶體內容複製回主機端向量。
     void copyToHost(vector<T>& host) const {
         host.resize(count_);
         CUDA_CHECK(cudaMemcpy(host.data(), ptr_, count_ * sizeof(T), cudaMemcpyDeviceToHost));
@@ -100,6 +111,7 @@ class DeviceBuffer {
 
 class EventTimer {
   public:
+        // 使用一組 CUDA event 量測 kernel 在 GPU 時間軸上的耗時。
     EventTimer() {
         CUDA_CHECK(cudaEventCreate(&start_));
         CUDA_CHECK(cudaEventCreate(&stop_));
@@ -110,6 +122,7 @@ class EventTimer {
         cudaEventDestroy(stop_);
     }
 
+    // 量測 fn 內提交的 GPU 工作耗時。
     float measure(const function<void()>& fn) {
         CUDA_CHECK(cudaEventRecord(start_));
         fn();
@@ -139,6 +152,7 @@ string trim(const string& s) {
     return s.substr(left, right - left);
 }
 
+// 讀取以逗號分隔的數字（0..9），轉為緊湊的 row-major 矩陣。
 MatrixU8 loadCsvMatrix(const string& path) {
     ifstream in(path);
     if (!in.is_open()) {
@@ -193,11 +207,13 @@ MatrixU8 loadCsvMatrix(const string& path) {
 }
 
 vector<BlockSize> defaultBlocks() {
+    // 用於效能測試的候選 block 組合。
     return {
         {8, 8}, {16, 8}, {8, 16}, {16, 16}, {32, 8}, {8, 32}, {32, 16}, {16, 32}, {32, 32},
     };
 }
 
+// 解析 --blocks 字串，例如 "16x16;32x8"。
 vector<BlockSize> parseBlockList(const string& raw) {
     vector<BlockSize> blocks;
     stringstream ss(raw);
@@ -219,6 +235,7 @@ vector<BlockSize> parseBlockList(const string& raw) {
 
         int bx = std::stoi(trim(part.substr(0, xPos)));
         int by = std::stoi(trim(part.substr(xPos + 1)));
+        // CUDA 限制：每個 block 最多 1024 threads，且每個維度 <= 1024。
         if (bx <= 0 || by <= 0 || bx > 1024 || by > 1024 || bx * by > 1024) {
             throw runtime_error("Invalid CUDA block size: " + part);
         }
@@ -234,6 +251,7 @@ vector<BlockSize> parseBlockList(const string& raw) {
 
 ArgConfig parseArgs(int argc, char** argv) {
     ArgConfig cfg;
+    // 除非使用者提供 --blocks，否則採用預設測試組合。
     cfg.blocks = defaultBlocks();
 
     for (int i = 1; i < argc; ++i) {
@@ -244,9 +262,23 @@ ArgConfig parseArgs(int argc, char** argv) {
             cfg.largePath = argv[++i];
         } else if (arg == "--blocks" && i + 1 < argc) {
             cfg.blocks = parseBlockList(argv[++i]);
+        } else if (arg == "--thread-sweep") {
+            cfg.runThreadSweep = true;
+        } else if (arg == "--thread-sweep-max" && i + 1 < argc) {
+            cfg.runThreadSweep = true;
+            cfg.threadSweepMax = std::stoi(argv[++i]);
+        } else if (arg == "--sweep-repeats" && i + 1 < argc) {
+            cfg.runThreadSweep = true;
+            cfg.sweepRepeats = std::stoi(argv[++i]);
+        } else if (arg == "--thread-sweep-csv" && i + 1 < argc) {
+            cfg.runThreadSweep = true;
+            cfg.threadSweepCsv = argv[++i];
         } else if (arg == "--help") {
             cout << "Usage:\n"
-                      << "  template_matching.exe --small <S_file> --large <T_file> [--blocks 8x8;16x16;32x8]\n";
+                      << "  template_matching.exe --small <S_file> --large <T_file> [--blocks 8x8;16x16;32x8]\n"
+                      << "  template_matching.exe --small <S_file> --large <T_file> --thread-sweep\n"
+                      << "                       [--thread-sweep-max 12] [--sweep-repeats 3]\n"
+                      << "                       [--thread-sweep-csv thread_sweep.csv]\n";
             std::exit(0);
         } else {
             throw runtime_error("Unknown/invalid argument: " + arg);
@@ -256,12 +288,19 @@ ArgConfig parseArgs(int argc, char** argv) {
     if (cfg.smallPath.empty() || cfg.largePath.empty()) {
         throw runtime_error("Missing --small or --large argument");
     }
+    if (cfg.threadSweepMax <= 0 || cfg.threadSweepMax > 1024) {
+        throw runtime_error("--thread-sweep-max must be in [1, 1024]");
+    }
+    if (cfg.sweepRepeats <= 0) {
+        throw runtime_error("--sweep-repeats must be > 0");
+    }
 
     return cfg;
 }
 
 __global__ void ssdKernel(const uint8_t* small, int sRows, int sCols, const uint8_t* large, int lCols,
                           int outRows, int outCols, int* out) {
+    // 每個 thread 負責計算一個輸出座標 (row, col)。
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
     const int row = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -270,6 +309,7 @@ __global__ void ssdKernel(const uint8_t* small, int sRows, int sCols, const uint
     }
 
     int sum = 0;
+    // SSD：在整個模板區域計算 sum((S - T_window)^2)。
     for (int r = 0; r < sRows; ++r) {
         const int largeRowBase = (row + r) * lCols + col;
         const int smallRowBase = r * sCols;
@@ -284,6 +324,7 @@ __global__ void ssdKernel(const uint8_t* small, int sRows, int sCols, const uint
 
 __global__ void pccKernel(const uint8_t* small, int sRows, int sCols, const uint8_t* large, int lCols,
                           int outRows, int outCols, float* out) {
+    // 每個 thread 負責計算一個輸出座標 (row, col)。
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
     const int row = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -295,6 +336,7 @@ __global__ void pccKernel(const uint8_t* small, int sRows, int sCols, const uint
     double sumX = 0.0;
     double sumY = 0.0;
 
+    // 第一次走訪：計算模板與對應視窗的平均值。
     for (int r = 0; r < sRows; ++r) {
         const int largeRowBase = (row + r) * lCols + col;
         const int smallRowBase = r * sCols;
@@ -311,6 +353,7 @@ __global__ void pccKernel(const uint8_t* small, int sRows, int sCols, const uint
     double denX = 0.0;
     double denY = 0.0;
 
+    // 第二次走訪：計算 Pearson 相關係數的分子與分母項。
     for (int r = 0; r < sRows; ++r) {
         const int largeRowBase = (row + r) * lCols + col;
         const int smallRowBase = r * sCols;
@@ -324,6 +367,7 @@ __global__ void pccKernel(const uint8_t* small, int sRows, int sCols, const uint
     }
 
     const double den = std::sqrt(denX * denY);
+    // 對常數視窗做除零保護。
     out[row * outCols + col] = static_cast<float>((den <= 1e-12) ? 0.0 : (num / den));
 }
 
@@ -332,6 +376,7 @@ float benchmarkSsd(const uint8_t* dSmall, int sRows, int sCols, const uint8_t* d
     const int outRows = lRows - sRows + 1;
     const int outCols = lCols - sCols + 1;
     dim3 blockDim(block.x, block.y);
+    // 用無條件進位切分 grid，確保每個輸出格都對應到一個 thread。
     dim3 gridDim((outCols + blockDim.x - 1) / blockDim.x, (outRows + blockDim.y - 1) / blockDim.y);
 
     EventTimer timer;
@@ -354,6 +399,7 @@ float benchmarkPcc(const uint8_t* dSmall, int sRows, int sCols, const uint8_t* d
 }
 
 vector<pair<int, int>> collectBestSsdPositions(const vector<int>& scores, int outRows, int outCols, int& bestVal) {
+    // SSD 以分數越小越好。
     bestVal = numeric_limits<int>::max();
     for (int v : scores) {
         bestVal = std::min(bestVal, v);
@@ -374,12 +420,14 @@ vector<pair<int, int>> collectBestSsdPositions(const vector<int>& scores, int ou
 
 vector<pair<int, int>> collectBestPccPositions(const vector<float>& scores, int outRows, int outCols,
                                                float& bestVal) {
+    // PCC 以分數越大越好。
     bestVal = -numeric_limits<float>::infinity();
     for (float v : scores) {
         bestVal = std::max(bestVal, v);
     }
 
     const float eps = 1e-6f;
+    // 浮點數以 epsilon 判定近似同分。
     vector<pair<int, int>> pos;
     pos.reserve(8);
     for (int r = 0; r < outRows; ++r) {
@@ -404,6 +452,7 @@ void printPositions(const vector<pair<int, int>>& pos) {
 }
 
 void run(const ArgConfig& cfg) {
+    // 1) 從文字檔讀入輸入矩陣。
     const MatrixU8 small = loadCsvMatrix(cfg.smallPath);
     const MatrixU8 large = loadCsvMatrix(cfg.largePath);
 
@@ -419,6 +468,7 @@ void run(const ArgConfig& cfg) {
     cout << "Large(T): " << large.rows << "x" << large.cols << "\n";
     cout << "Output map: " << outRows << "x" << outCols << "\n";
 
+    // 2) 配置 GPU 緩衝區，並一次上傳 S/T。
     DeviceBuffer<uint8_t> dSmall(small.data.size());
     DeviceBuffer<uint8_t> dLarge(large.data.size());
     DeviceBuffer<int> dSsdOut(outCount);
@@ -427,6 +477,7 @@ void run(const ArgConfig& cfg) {
     dSmall.copyFromHost(small.data);
     dLarge.copyFromHost(large.data);
 
+    // 3) 逐一測試候選 block 尺寸在 SSD/PCC 的執行時間。
     vector<pair<BlockSize, float>> ssdTimes;
     vector<pair<BlockSize, float>> pccTimes;
     ssdTimes.reserve(cfg.blocks.size());
@@ -446,7 +497,7 @@ void run(const ArgConfig& cfg) {
     auto bestPccIt = std::min_element(pccTimes.begin(), pccTimes.end(),
                                       [](const auto& a, const auto& b) { return a.second < b.second; });
 
-    // Re-run with best block size before copying results.
+    // 4) 用最佳時間的 block 再跑一次，產生最終輸出圖。
     benchmarkSsd(dSmall.get(), small.rows, small.cols, dLarge.get(), large.rows, large.cols, dSsdOut.get(),
                  bestSsdIt->first);
     benchmarkPcc(dSmall.get(), small.rows, small.cols, dLarge.get(), large.rows, large.cols, dPccOut.get(),
@@ -455,6 +506,7 @@ void run(const ArgConfig& cfg) {
     vector<int> hSsd;
     vector<float> hPcc;
 
+    // 5) 下載分數圖，並擷取所有最佳匹配座標。
     dSsdOut.copyToHost(hSsd);
     dPccOut.copyToHost(hPcc);
 
@@ -482,12 +534,60 @@ void run(const ArgConfig& cfg) {
         cout << "  " << b.x << "x" << b.y << " -> " << fixed << setprecision(3) << t << " ms\n";
     }
     cout << "Best block: " << bestPccIt->first.x << "x" << bestPccIt->first.y << "\n";
+
+    if (cfg.runThreadSweep) {
+        // 作業二需求：測試 thread=1..N（預設 N=12），觀察不同 thread 數下耗時。
+        struct ThreadSweepRow {
+            int threads;
+            float ssdMs;
+            float pccMs;
+        };
+
+        vector<ThreadSweepRow> rows;
+        rows.reserve(static_cast<size_t>(cfg.threadSweepMax));
+
+        for (int threads = 1; threads <= cfg.threadSweepMax; ++threads) {
+            BlockSize oneDimBlock{threads, 1};
+
+            float ssdSum = 0.0f;
+            float pccSum = 0.0f;
+            for (int rep = 0; rep < cfg.sweepRepeats; ++rep) {
+                ssdSum += benchmarkSsd(dSmall.get(), small.rows, small.cols, dLarge.get(), large.rows, large.cols,
+                                       dSsdOut.get(), oneDimBlock);
+                pccSum += benchmarkPcc(dSmall.get(), small.rows, small.cols, dLarge.get(), large.rows, large.cols,
+                                       dPccOut.get(), oneDimBlock);
+            }
+
+            rows.push_back({threads, ssdSum / static_cast<float>(cfg.sweepRepeats),
+                            pccSum / static_cast<float>(cfg.sweepRepeats)});
+        }
+
+        const string csvPath = cfg.threadSweepCsv.empty() ? "thread_sweep.csv" : cfg.threadSweepCsv;
+        ofstream csv(csvPath);
+        if (!csv.is_open()) {
+            throw runtime_error("Cannot open CSV output file: " + csvPath);
+        }
+        csv << "threads,ssd_ms,pcc_ms\n";
+        for (const auto& row : rows) {
+            csv << row.threads << "," << fixed << setprecision(6) << row.ssdMs << "," << row.pccMs << "\n";
+        }
+
+        cout << "\n=== Thread Sweep (1D block: thread x 1) ===\n";
+        cout << "Repeat per point: " << cfg.sweepRepeats << "\n";
+        cout << left << setw(10) << "Threads" << setw(14) << "SSD(ms)" << setw(14) << "PCC(ms)" << "\n";
+        for (const auto& row : rows) {
+            cout << left << setw(10) << row.threads << setw(14) << fixed << setprecision(6) << row.ssdMs
+                 << setw(14) << row.pccMs << "\n";
+        }
+        cout << "CSV saved to: " << csvPath << "\n";
+    }
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     try {
+        // 解析命令列參數並執行完整流程。
         ArgConfig cfg = parseArgs(argc, argv);
         run(cfg);
         return 0;

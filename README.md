@@ -75,3 +75,34 @@ powershell -ExecutionPolicy Bypass -File .\code_runner.ps1 -Blocks "8x8;16x16;32
 - `--small <path>`：小矩陣 S（template/kernel）
 - `--large <path>`：大矩陣 T（search image）
 - `--blocks "8x8;16x16;..."`：要測試的 block size 清單，分號分隔
+- `--thread-sweep`：啟用 thread 數量測試（預設 1~12）
+- `--thread-sweep-max <N>`：thread 測試上限（例如 12）
+- `--sweep-repeats <N>`：每個 thread 點重複執行次數（取平均）
+- `--thread-sweep-csv <path>`：thread 測試輸出 CSV 路徑
+
+## 作業二：thread 1~12 時間測試與圖表
+
+題目指定核心數 6，因此 thread 測試範圍為 1~12。可直接用：
+
+```bash
+./template_matching --small data/4/S4_5_5.txt --large data/4/T4_50_50.txt \
+	--thread-sweep --thread-sweep-max 12 --sweep-repeats 5 \
+	--thread-sweep-csv thread_sweep_case4.csv
+```
+
+執行後會同時輸出：
+
+- 終端機上的 thread 對應時間表
+- CSV 檔（欄位：`threads,ssd_ms,pcc_ms`）
+
+用繪圖腳本產生圖表：
+
+```bash
+python3 plot_thread_sweep.py --input thread_sweep_case4.csv --output thread_sweep_case4.png
+```
+
+若尚未安裝 matplotlib：
+
+```bash
+python3 -m pip install matplotlib
+```

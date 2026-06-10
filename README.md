@@ -1,48 +1,68 @@
-# CUDA Template Matching (PCC + SSD)
+# Template Matching (全 C++ 版本)
 
-這個專案使用 CUDA + C++ 完成作業要求的 Template Matching：
+這個專案目前可直接用純 C++ 執行 Template Matching：
 
 - SSD (Sum of Squared Differences)
 - PCC (Pearson Correlation Coefficient)
 
-程式會輸出：
+輸出內容包含：
 
 - 最佳匹配座標 `(row,col)`，若有多個同分會全部列出
-- 不同 block size 下的執行時間
-- 各方法最佳 block size
+- 不同 thread 數量下的執行時間
+- 各方法最佳 thread 數量
+- 可選的 thread sweep CSV（用於作圖）
 
-## 檔案
+## 主要檔案
 
-- `template_matching.cu`：主程式
-- `run_all.bat`：依序執行作業 4 組資料
+- `template_matching.cpp`：純 C++ 主程式（`std::thread` 平行）
+- `code_runner.sh`：Linux/macOS 一鍵編譯執行
+- `code_runner.ps1`：Windows PowerShell 一鍵編譯執行
+- `plot_thread_sweep.py`：將 thread sweep CSV 繪成圖
+- `template_matching.cu`：原 CUDA 版本（保留）
 
-## 編譯
+## 編譯（純 C++）
 
-請先確認 `nvcc` 可用（CUDA Toolkit 已安裝）。
+Linux/macOS：
 
-```bat
-nvcc -O3 -std=c++17 template_matching.cu -o template_matching.exe
+```bash
+g++ -O3 -std=c++17 -pthread template_matching.cpp -o template_matching
+```
+
+Windows（MinGW-w64 / MSYS2）：
+
+```powershell
+g++.exe -O3 -std=c++17 -pthread template_matching.cpp -o template_matching.exe
 ```
 
 ## 單組執行
 
-```bat
-template_matching.exe --small data\1\S1_3_3.txt --large data\1\T1_3750_4320.txt
+Linux/macOS：
+
+```bash
+./template_matching --small data/4/S4_5_5.txt --large data/4/T4_50_50.txt
 ```
 
-可自訂 block size：
+Windows：
 
-```bat
-template_matching.exe --small data\1\S1_3_3.txt --large data\1\T1_3750_4320.txt --blocks "8x8;16x16;32x8;32x16"
+```powershell
+.\template_matching.exe --small data/4/S4_5_5.txt --large data/4/T4_50_50.txt
 ```
 
-## 四組資料一次跑完
+可自訂 thread 清單：
 
-```bat
-run_all.bat
+```bash
+./template_matching --small data/4/S4_5_5.txt --large data/4/T4_50_50.txt --threads "1;2;4;8;12"
 ```
 
-或直接用 PowerShell code runner：
+## 一鍵跑全部測資
+
+Linux/macOS：
+
+```bash
+bash code_runner.sh
+```
+
+Windows：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\code_runner.ps1
@@ -50,59 +70,34 @@ powershell -ExecutionPolicy Bypass -File .\code_runner.ps1
 
 只編譯不執行：
 
+```bash
+bash code_runner.sh --build-only
+```
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\code_runner.ps1 -BuildOnly
 ```
 
-自訂 blocks 跑全部：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\code_runner.ps1 -Blocks "8x8;16x16;32x8"
-```
-
-## VS Code Code Runner 外掛
-
-已在工作區設定 `.cu` 副檔名對應到 `code_runner.ps1`。
-
-使用方式：
-
-1. 在 VS Code 開啟 [template_matching.cu](template_matching.cu)
-2. 按 `Ctrl+Alt+N`（Code Runner 預設快捷鍵）
-3. 會自動執行 `code_runner.ps1`，進行編譯並跑 4 組測資
-
-## 參數說明
-
-- `--small <path>`：小矩陣 S（template/kernel）
-- `--large <path>`：大矩陣 T（search image）
-- `--blocks "8x8;16x16;..."`：要測試的 block size 清單，分號分隔
-- `--thread-sweep`：啟用 thread 數量測試（預設 1~12）
-- `--thread-sweep-max <N>`：thread 測試上限（例如 12）
-- `--sweep-repeats <N>`：每個 thread 點重複執行次數（取平均）
-- `--thread-sweep-csv <path>`：thread 測試輸出 CSV 路徑
-
-## 作業二：thread 1~12 時間測試與圖表
-
-題目指定核心數 6，因此 thread 測試範圍為 1~12。可直接用：
+## Thread Sweep（1~12）
 
 ```bash
 ./template_matching --small data/4/S4_5_5.txt --large data/4/T4_50_50.txt \
-	--thread-sweep --thread-sweep-max 12 --sweep-repeats 5 \
-	--thread-sweep-csv thread_sweep_case4.csv
+  --thread-sweep --thread-sweep-max 12 --sweep-repeats 5 \
+  --thread-sweep-csv thread_sweep_case4.csv
 ```
 
-執行後會同時輸出：
-
-- 終端機上的 thread 對應時間表
-- CSV 檔（欄位：`threads,ssd_ms,pcc_ms`）
-
-用繪圖腳本產生圖表：
+繪圖：
 
 ```bash
 python3 plot_thread_sweep.py --input thread_sweep_case4.csv --output thread_sweep_case4.png
 ```
 
-若尚未安裝 matplotlib：
+## 參數說明
 
-```bash
-python3 -m pip install matplotlib
-```
+- `--small <path>`：小矩陣 S（template）
+- `--large <path>`：大矩陣 T（search image）
+- `--threads "1;2;4;..."`：要測試的 thread 數量清單（分號分隔）
+- `--thread-sweep`：啟用 thread sweep
+- `--thread-sweep-max <N>`：thread sweep 最大 thread
+- `--sweep-repeats <N>`：每個點重複次數（取平均）
+- `--thread-sweep-csv <path>`：CSV 輸出路徑

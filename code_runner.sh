@@ -4,10 +4,10 @@ set -euo pipefail
 # 控制編譯/執行行為的旗標。
 BUILD_ONLY=0
 SKIP_BUILD=0
-BLOCKS=""
+THREADS=""
 
 usage() {
-  echo "Usage: $0 [--build-only] [--skip-build] [--blocks \"16x16;32x8\"]"
+  echo "Usage: $0 [--build-only] [--skip-build] [--threads \"1;2;4;8\"]"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -20,13 +20,13 @@ while [[ $# -gt 0 ]]; do
       SKIP_BUILD=1
       shift
       ;;
-    --blocks)
+    --threads)
       if [[ $# -lt 2 ]]; then
-        echo "[ERROR] --blocks requires a value." >&2
+        echo "[ERROR] --threads requires a value." >&2
         usage
         exit 2
       fi
-      BLOCKS="$2"
+      THREADS="$2"
       shift 2
       ;;
     -h|--help)
@@ -44,14 +44,14 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-build_cuda_project() {
-  # 編譯 .cu 檔案需要 nvcc。
-  if ! command -v nvcc >/dev/null 2>&1; then
-    echo "[ERROR] nvcc not found in PATH. Please install CUDA Toolkit." >&2
+build_cpp_project() {
+  # 編譯純 C++ 版本需要 g++。
+  if ! command -v g++ >/dev/null 2>&1; then
+    echo "[ERROR] g++ not found in PATH." >&2
     return 1
   fi
 
-  local build_cmd=(nvcc -O3 -std=c++17 template_matching.cu -o template_matching)
+  local build_cmd=(g++ -O3 -std=c++17 -pthread template_matching.cpp -o template_matching)
   echo "[INFO] Building: ${build_cmd[*]}"
   "${build_cmd[@]}"
 }
@@ -67,16 +67,16 @@ invoke_case() {
   echo "==============================="
 
   local cmd=(./template_matching --small "$small" --large "$large")
-  # 只有使用者提供 --blocks 時才附加自訂 block 清單。
-  if [[ -n "$BLOCKS" ]]; then
-    cmd+=(--blocks "$BLOCKS")
+  # 只有使用者提供 --threads 時才附加自訂 thread 清單。
+  if [[ -n "$THREADS" ]]; then
+    cmd+=(--threads "$THREADS")
   fi
 
   "${cmd[@]}"
 }
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
-  build_cuda_project
+  build_cpp_project
 fi
 
 if [[ "$BUILD_ONLY" -eq 1 ]]; then
